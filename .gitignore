@@ -1,0 +1,17 @@
+# Ignore the domains.conf file so it's not committed to the repository.
+# Users should copy domains.example.conf to domains.conf and modify it.
+config/cert-helper/domains.conf
+
+# Ignore the buckets.conf file so it's not committed to the repository.
+# Users should copy buckets.example.conf to buckets.conf and modify it.
+config/minio/buckets.conf
+
+# Ignore generated certificates.
+config/nginx-proxy/certs/*.key
+config/nginx-proxy/certs/*.crt
+
+# Ignore any application specific proxy configs.
+config/nginx-proxy/vhost.d/
+
+# Ignore the data directory so sensitive info is not committed to the repository.
+data/

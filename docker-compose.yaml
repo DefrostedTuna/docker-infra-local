@@ -1,0 +1,172 @@
+networks:
+  local:
+    name: local
+    driver: bridge
+
+services:
+  #------------------------------------------------------------------------------
+  # The Nginx Proxy will allow us to bind applications to various hostnames.
+  # This needs to be running globally on the system and must be bound to
+  # ports 80 and 443. If anything else is bound to these ports the proxy will
+  # not function properly. Each application should define a VIRTUAL_HOST and
+  # (optionally) a VIRTUAL_PORT environment variable that will bind the hostname.
+  # Don't forget to bind any VIRTUAL_HOST values to 127.0.0.1 in the hosts file!
+  #
+  # See: https://github.com/nginx-proxy/nginx-proxy for details on how to set up
+  # each application in more detail, or for more advanced configuration options.
+  #------------------------------------------------------------------------------
+  reverse-proxy:
+    image: nginxproxy/nginx-proxy:alpine
+    container_name: reverse-proxy
+    ports:
+      - 80:80
+      - 443:443
+    volumes:
+      - ./config/nginx-proxy/certs:/etc/nginx/certs
+      - ./config/nginx-proxy/vhost.d:/etc/nginx/vhost.d:ro
+      - /var/run/docker.sock:/tmp/docker.sock:ro
+    networks:
+      - local
+
+  #------------------------------------------------------------------------------
+  # The Certificate Helper will watch the domains.conf configuration and generate
+  # self-signed SSL certificates for any domain that doesn't already have one.
+  # These SSL certs will be read by the nginx proxy and assigned to any matching
+  # container that has the same VIRTUAL_HOST valued defined in its configuration.
+  # This is useful in order to host web applications behind SSL certificates
+  # locally, and have them act as though they would in a production environment.
+  #
+  # Environment Variables:
+  #   CHECK_INTERVAL:          How often to poll for file changes (default: 5s)
+  #   RENEWAL_THRESHOLD_DAYS:  Regenerate certs expiring within N days (default: 30)
+  #   CERT_CHECK_INTERVAL:     How often to check certs (default: 86400s / 24h)
+  #   CERT_VALIDITY_DAYS:      Validity period for certificates (default: 365)
+  #   CLEANUP_ORPHANED:        Prune certs not in domains.conf (default: true)
+  #------------------------------------------------------------------------------
+  cert-helper:
+    image: alpine/openssl:3.5.5
+    container_name: cert-helper
+    volumes:
+      - ./config/nginx-proxy/certs:/certs
+      - ./config/cert-helper:/config
+    entrypoint: ["/bin/sh", "/config/cert-helper.sh"]
+
+  #------------------------------------------------------------------------------
+  # This simple echo container can be used to make sure that the reverse proxy is
+  # up and running, and is useful for troubleshooting issues if they are present.
+  #------------------------------------------------------------------------------
+  whoami:
+    image: jwilder/whoami
+    container_name: whoami
+    environment:
+      VIRTUAL_HOST: whoami.local
+    networks:
+      - local
+
+  #------------------------------------------------------------------------------
+  # Global mariadb container to use for various projects on the same network.
+  #------------------------------------------------------------------------------
+  mariadb:
+    image: mariadb:12.2.2
+    container_name: mariadb
+    ports:
+      - 3306:3306
+    volumes:
+      - ./data/mariadb:/var/lib/mysql
+      - ./config/mariadb/mariadb.cnf:/etc/mysql/mariadb.cnf
+    environment:
+      VIRTUAL_HOST: mariadb.local
+      MYSQL_ROOT_PASSWORD: secret
+      MYSQL_USER: admin
+      MYSQL_PASSWORD: secret
+    networks:
+      - local
+
+  #------------------------------------------------------------------------------
+  # Global redis container to use for various projects on the same network.
+  #------------------------------------------------------------------------------
+  redis:
+    image: redis:alpine
+    container_name: redis
+    ports:
+      - 6379:6379
+    environment:
+      VIRTUAL_HOST: redis.local
+    networks:
+      - local
+  
+  #------------------------------------------------------------------------------
+  # Global meilisearch container to use for various projects on the same network.
+  #------------------------------------------------------------------------------
+  meilisearch:
+    image: getmeili/meilisearch:v1.35.0
+    container_name: meilisearch
+    ports:
+      - 7700:7700
+    volumes:
+      - ./data/meilisearch:/data.ms
+    environment:
+      VIRTUAL_HOST: meilisearch.local
+      MEILI_MASTER_KEY: super-secret-master-key
+      MEILI_NO_ANALYTICS: 'true'
+    networks:
+      - local
+
+  #------------------------------------------------------------------------------
+  # Global MinIO container for S3-compatible object storage.
+  # Provides both API (port 9000) and Console (port 9001) access.
+  # The Console port is forwarded to the reverse proxy and the instance is
+  # available via https://minio.local in a web browser without specifying a port.
+  #------------------------------------------------------------------------------
+  minio:
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    container_name: minio
+    ports:
+      - 9000:9000
+      - 9001:9001
+    volumes:
+      - ./data/minio:/data
+    environment:
+      VIRTUAL_HOST: minio.local
+      VIRTUAL_PORT: 9001
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    command: server /data --console-address ":9001"
+    # The bucket helper needs a healthy instance before it can
+    # start processing commands. Use an explicit health check
+    # to ensure that the instance is up and running beforehand.
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://minio.local:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    networks:
+      - local
+
+  #------------------------------------------------------------------------------
+  # The MinIO Bucket Helper watches the buckets.conf configuration and creates
+  # buckets that don't already exist. This is helpful so that users don't have
+  # to either access the web based console, or connect to the CLI manually for
+  # bucket creation. It also sets the access policies for each bucket defined.
+  #
+  # Environment Variables:
+  #   MINIO_ENDPOINT:       MinIO API endpoint (default: http://minio:9000)
+  #   MINIO_ROOT_USER:      MinIO admin username (default: minioadmin)
+  #   MINIO_ROOT_PASSWORD:  MinIO admin password (default: minioadmin)
+  #   CHECK_INTERVAL:       How often to poll for file changes (default: 5s)
+  #------------------------------------------------------------------------------
+  minio-bucket-helper:
+    image: minio/mc:RELEASE.2025-08-13T08-35-41Z
+    container_name: minio-bucket-helper
+    depends_on:
+      minio:
+        condition: service_healthy
+    volumes:
+      - ./config/minio:/config
+    environment:
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    entrypoint: ["/bin/sh", "/config/bucket-helper.sh"]
+    networks:
+      - local
