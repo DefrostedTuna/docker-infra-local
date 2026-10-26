@@ -221,7 +221,7 @@ certutil -addstore -f "ROOT" config\nginx-proxy\certs\{domain}.crt
 
 After adding the certificate to the trust store, browsers will validate the certificate without warnings.
 
-**Note:** Most browsers will require a restart for the certificate stores to see the new certificates.
+**Note:** Most browsers will require a restart for the certificate stores to see the new certificates. In the case of Firefox and Arch Linux, ensure that Firefox is reading the certificates from the system store (see [Firefox's documentation](https://support.mozilla.org/en-US/kb/setting-certificate-authorities-firefox#w_linux), and [Arch Linux's documentation](https://wiki.archlinux.org/title/Transport_Layer_Security#Certificate_authorities)).
 
 ### Certificate Helper
 
@@ -263,13 +263,13 @@ The MariaDB service provides a relational database that persists data to the loc
 By default, no databases are created. A database can be created using the following command.
 
 ```conf
-docker exec mariadb mysql -u root -psecret -e "CREATE DATABASE database_name;"
+docker exec mariadb mariadb -u root -psecret -e "CREATE DATABASE database_name;"
 ```
 
 Permissions must be granted to users after a database is created in this way.
 
 ```conf
-docker exec mariadb mysql -u root -psecret -e "GRANT ALL PRIVILEGES ON database_name.* TO 'admin'@'%'; FLUSH PRIVILEGES;"
+docker exec mariadb mariadb -u root -psecret -e "GRANT ALL PRIVILEGES ON database_name.* TO 'admin'@'%'; FLUSH PRIVILEGES;"
 ```
 
 External tools such as [Sequel Ace](https://sequel-ace.com/) can connect to the database using the hostname `mariadb.local` and the credentials defined below.
