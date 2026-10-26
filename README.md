@@ -184,24 +184,24 @@ Binding the hostname to the system's `hosts` file varies depending on the system
 
 The reverse proxy handles SSL termination for all containers in the stack. When an HTTPS request is received, the proxy looks for a certificate file that matches the requested hostname. Certificates are stored in the `config/nginx-proxy/certs/` directory, with the certificate file named `{domain}.crt` and the private key named `{domain}.key`.
 
-The bundled Certificate Helper container automatically generates self-signed certificates for domains listed in `config/cert-helper/domains.conf`. This allows applications to be served over HTTPS without manually creating certificates.
+The bundled Certificate Helper container automatically generates a local Root CA and uses it to sign per-domain leaf certificates for every domain listed in `config/cert-helper/domains.conf`. The Root CA is generated once on first run and persists in `config/nginx-proxy/certs/local-root-ca.crt` (with its private key also at `config/nginx-proxy/certs/local-root-ca.key`). This allows applications to be served over HTTPS without manually creating certificates.
 
-Since the certificates are self-signed, they are not trusted by default by browsers or the operating system. To avoid browser warnings, the certificates must be added to the local system's trust store.
+Because every leaf certificate is signed by the same Root CA, you only need to trust the Root CA **once**. All current and future domains in `config/cert-helper/domains.conf` will be trusted automatically.
 
 **macOS**
 
 ```bash
-sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain config/nginx-proxy/certs/{domain}.crt
+sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain config/nginx-proxy/certs/local-root-ca.crt
 ```
 
 **Linux (Arch)**
 
 ```bash
 # Recommended
-sudo trust anchor --store config/nginx-proxy/certs/{domain}.crt
+sudo trust anchor --store config/nginx-proxy/certs/local-root-ca.crt
 
 # Manually
-sudo cp config/nginx-proxy/certs/{domain}.crt /etc/ca-certificates/trust-source/anchors/
+sudo cp config/nginx-proxy/certs/local-root-ca.crt /etc/ca-certificates/trust-source/anchors/
 
 sudo update-ca-trust
 ```
@@ -209,23 +209,41 @@ sudo update-ca-trust
 **Linux (Debian/Ubuntu)**
 
 ```bash
-sudo cp config/nginx-proxy/certs/{domain}.crt /usr/local/share/ca-certificates/
+sudo cp config/nginx-proxy/certs/local-root-ca.crt /usr/local/share/ca-certificates/
 sudo update-ca-certificates
 ```
 
 **Windows**
 
 ```
-certutil -addstore -f "ROOT" config\nginx-proxy\certs\{domain}.crt
+certutil -addstore -f "ROOT" config\nginx-proxy\certs\local-root-ca.crt
 ```
 
-After adding the certificate to the trust store, browsers will validate the certificate without warnings.
+After adding the Root CA to the trust store, browsers will validate every domain's leaf certificate without warnings.
 
-**Note:** Most browsers will require a restart for the certificate stores to see the new certificates. In the case of Firefox and Arch Linux, ensure that Firefox is reading the certificates from the system store (see [Firefox's documentation](https://support.mozilla.org/en-US/kb/setting-certificate-authorities-firefox#w_linux), and [Arch Linux's documentation](https://wiki.archlinux.org/title/Transport_Layer_Security#Certificate_authorities)).
+**Note:** Most browsers will require a restart for the certificate stores to see the new certificates.
+
+##### Firefox on Linux (Arch)
+
+Firefox uses its own certificate database (NSS) and does **not** read the operating system's trust store by default. On Linux, the supported way to make Firefox honor system-trusted certificates is to load the p11-kit PKCS#11 module via a Firefox enterprise policy.
+
+Create `/etc/firefox/policies/policies.json` with the following contents:
+
+```json
+{
+  "policies": {
+    "SecurityDevices": {
+      "p11-kit-trust": "/usr/lib/pkcs11/p11-kit-trust.so"
+    }
+  }
+}
+```
+
+Then fully quit and restart Firefox. Once loaded, Firefox will read the same trust store that `trust anchor` and `update-ca-trust` write to, so the Root CA (and any future certificates trusted system-wide) will be honored automatically. See [Firefox's documentation](https://support.mozilla.org/en-US/kb/setting-certificate-authorities-firefox#w_linux) and [Arch Linux's documentation](https://wiki.archlinux.org/title/Transport_Layer_Security#Certificate_authorities) for more details.
 
 ### Certificate Helper
 
-The certificate helper is a companion container that automatically generates self-signed SSL certificates for the reverse proxy. It watches the `config/cert-helper/domains.conf` file and creates certificates for any domain or hostname that does not already have one. Certificates are regenerated automatically when they approach expiration. This allows applications to be served over HTTPS locally, mirroring how they would be configured in a production environment.
+The certificate helper is a companion container that automatically generates SSL certificates for the reverse proxy. On first run it creates a local Root CA, then watches the `config/cert-helper/domains.conf` file and signs a leaf certificate for any domain or hostname that does not already have one. Certificates are regenerated automatically when they approach expiration. This allows applications to be served over HTTPS locally, mirroring how they would be configured in a production environment.
 
 The certificate helper service can be configured with the following environment variables:
 
@@ -235,10 +253,16 @@ The certificate helper service can be configured with the following environment 
 | `CHECK_INTERVAL`         | `5s`                  | How often to poll for file changes             |
 | `RENEWAL_THRESHOLD_DAYS` | `30`                  | Regenerate certs expiring within {N} days      |
 | `CERT_CHECK_INTERVAL`    | `86400s`              | How often to check certificates for expiration |
-| `CERT_VALIDITY_DAYS`     | `365`                 | Validity period for new certificates           |
+| `CERT_VALIDITY_DAYS`     | `365`                 | Validity period for new leaf certificates      |
 | `CLEANUP_ORPHANED`       | `true`                | Remove certs for domains no longer in config   |
+| `CA_CERT`                | `/certs/local-root-ca.crt` | Path to the local Root CA certificate    |
+| `CA_KEY`                 | `/certs/local-root-ca.key` | Path to the local Root CA private key    |
+| `CA_SERIAL`              | `/certs/local-root-ca.srl` | Path to the Root CA serial number file   |
+| `CA_VALIDITY_DAYS`       | `3650`                | Validity period for the Root CA (10 years)     |
+| `CA_CN`                  | `Docker Infra Local Root CA` | Common Name for the Root CA             |
+| `LEAF_VALIDITY_DAYS`     | `365`                 | Validity period for per-domain leaf certs      |
 
-Since the certificates are self-signed, they are not trusted by default by browsers or the operating system. To avoid browser warnings, the certificates must be added to the local system's trust store. See [HTTPS and SSL Termination](#https-and-ssl-termination) for more details.
+Because every leaf certificate is signed by the same Root CA, the Root CA only needs to be added to the local system's trust store once. See [HTTPS and SSL Termination](#https-and-ssl-termination) for more details.
 
 ### Whoami
 
@@ -441,7 +465,7 @@ The combination of setting the `VIRTUAL_HOST` variable and adding it to the `hos
 
 ### SSL Certificate Support
 
-To serve an application over HTTPS, add the hostname to the `config/cert-helper/domains.conf` file. The certificate helper service will automatically generate a self-signed SSL certificate for the hostname when it detects the change.
+To serve an application over HTTPS, add the hostname to the `config/cert-helper/domains.conf` file. The certificate helper service will automatically generate a leaf certificate signed by the local Root CA for the hostname when it detects the change.
 
 ```conf
 # config/cert-helper/domains.conf
@@ -449,7 +473,7 @@ To serve an application over HTTPS, add the hostname to the `config/cert-helper/
 api.awesome-web.local
 ```
 
-Once the certificate is generated, the application will be accessible via `https://api.awesome-web.local`. However, since the certificate is self-signed, browsers will display a warning. To resolve this, add the certificate to the local system's trust store. See the [HTTPS and SSL Termination](#https-and-ssl-termination) section for details.
+Once the certificate is generated, the application will be accessible via `https://api.awesome-web.local`. As long as the local Root CA has been added to the system's trust store (a one-time setup), browsers will validate the leaf certificate without warnings. See the [HTTPS and SSL Termination](#https-and-ssl-termination) section for details.
 
 ### Complete Example
 

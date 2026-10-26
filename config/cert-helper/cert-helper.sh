@@ -7,7 +7,7 @@
 # certificates and regenerate them if necessary.
 # ===================================================================
 
-# Allow enviroment variables to override the default values.
+# Allow environment variables to override the default values.
 DOMAINS_FILE="${DOMAINS_FILE:-/config/domains.conf}"
 DOMAINS_EXAMPLE_FILE="${DOMAINS_EXAMPLE_FILE:-/config/domains.example.conf}"
 CERTS_DIR="${CERTS_DIR:-/certs}"
@@ -16,6 +16,17 @@ RENEWAL_THRESHOLD_DAYS="${RENEWAL_THRESHOLD_DAYS:-30}"
 CERT_CHECK_INTERVAL="${CERT_CHECK_INTERVAL:-86400}"
 CERT_VALIDITY_DAYS="${CERT_VALIDITY_DAYS:-365}"
 CLEANUP_ORPHANED="${CLEANUP_ORPHANED:-true}"
+
+# Root CA settings.
+# A single local Root CA is generated once and used to sign every per-domain
+# leaf certificate. Trusting this Root CA once is sufficient for all current
+# and future domains; per-domain trust-store entries are no longer required.
+CA_CERT="${CA_CERT:-${CERTS_DIR}/local-root-ca.crt}"
+CA_KEY="${CA_KEY:-${CERTS_DIR}/local-root-ca.key}"
+CA_SERIAL="${CA_SERIAL:-${CERTS_DIR}/local-root-ca.srl}"
+CA_VALIDITY_DAYS="${CA_VALIDITY_DAYS:-3650}"
+CA_CN="${CA_CN:-Docker Infra Local Root CA}"
+LEAF_VALIDITY_DAYS="${LEAF_VALIDITY_DAYS:-${CERT_VALIDITY_DAYS}}"
 
 should_stop=0
 
@@ -42,6 +53,41 @@ init_domains_file() {
             # Just in case the user removed the example file.
             log "Warning: Neither $DOMAINS_FILE nor $DOMAINS_EXAMPLE_FILE found"
         fi
+    fi
+}
+
+# Ensure that the local Root CA exists and is valid.
+# This CA is generated once on first run and used to sign every per-domain
+# leaf certificate. It persists across container restarts in the certs dir.
+ensure_root_ca() {
+    if [ -f "$CA_CERT" ] && [ -f "$CA_KEY" ]; then
+        # Validate that the existing CA cert is not expired.
+        if openssl x509 -in "$CA_CERT" -noout -checkend 0 2>/dev/null; then
+            log "Root CA is valid: $CA_CERT"
+            return 0
+        else
+            log "Root CA has expired, regenerating..."
+        fi
+    else
+        log "Root CA not found, generating..."
+    fi
+
+    openssl req -x509 \
+        -nodes \
+        -subj "/CN=$CA_CN" \
+        -newkey rsa:4096 \
+        -keyout "$CA_KEY" \
+        -out "$CA_CERT" \
+        -addext "basicConstraints=critical,CA:TRUE" \
+        -addext "keyUsage=critical,keyCertSign,cRLSign" \
+        -days "$CA_VALIDITY_DAYS"
+
+    if [ $? -eq 0 ]; then
+        chmod 600 "$CA_KEY"
+        log "Successfully generated Root CA: $CA_CERT"
+    else
+        log "ERROR: Failed to generate Root CA"
+        return 1
     fi
 }
 
@@ -93,16 +139,49 @@ generate_cert() {
         log "Generating new certificate for: $domain"
     fi
 
-    openssl req -x509 \
-        -nodes \
-        -subj "/CN=$domain" \
-        -newkey rsa:4096 \
-        -keyout "$key_file" \
-        -out "$crt_file" \
-        -addext "subjectAltName=DNS:$domain" \
-        -days "$CERT_VALIDITY_DAYS"
+    # Generate the domain private key.
+    openssl genrsa -out "$key_file" 4096 2>/dev/null
+    if [ $? -ne 0 ]; then
+        log "ERROR: Failed to generate key for: $domain"
+        return 1
+    fi
+    chmod 600 "$key_file"
 
-    if [ $? -eq 0 ]; then
+    # Generate a Certificate Signing Request for the domain.
+    csr_file="${CERTS_DIR}/${domain}.csr"
+    openssl req -new -key "$key_file" -subj "/CN=$domain" -out "$csr_file" 2>/dev/null
+    if [ $? -ne 0 ]; then
+        log "ERROR: Failed to generate CSR for: $domain"
+        rm -f "$csr_file"
+        return 1
+    fi
+
+    # Write the leaf certificate extensions to a temp file.
+    # Alpine's sh does not support process substitution, so a temp file is used.
+    ext_file="${CERTS_DIR}/${domain}.ext"
+    printf '%s\n' \
+        "basicConstraints=critical,CA:FALSE" \
+        "keyUsage=critical,digitalSignature,keyEncipherment" \
+        "extendedKeyUsage=serverAuth" \
+        "subjectAltName=DNS:$domain" > "$ext_file"
+
+    # Sign the CSR with the local Root CA to produce a leaf certificate.
+    openssl x509 -req \
+        -in "$csr_file" \
+        -CA "$CA_CERT" \
+        -CAkey "$CA_KEY" \
+        -CAserial "$CA_SERIAL" \
+        -CAcreateserial \
+        -extfile "$ext_file" \
+        -days "$LEAF_VALIDITY_DAYS" \
+        -out "$crt_file" 2>/dev/null
+
+    sign_status=$?
+
+    # Clean up the temporary CSR and extensions files.
+    rm -f "$csr_file" "$ext_file"
+
+    if [ "$sign_status" -eq 0 ]; then
         log "Successfully generated certificate for: $domain"
     else
         log "ERROR: Failed to generate certificate for: $domain"
@@ -135,6 +214,13 @@ cleanup_orphaned_certs() {
 
         domain=$(basename "$crt_file" .crt)
         key_file="${CERTS_DIR}/${domain}.key"
+
+        # Never treat the local Root CA as an orphaned domain certificate.
+        # It lives in the certs dir alongside the leaf certs but it should
+        # not be listed in domains.conf with said leaf certs.
+        case "$domain" in
+            local-root-ca) continue ;;
+        esac
 
         # Check if the domain is in the valid list.
         case " $valid_domains " in
@@ -184,14 +270,21 @@ display_config() {
     log "  CERT_CHECK_INTERVAL: ${CERT_CHECK_INTERVAL}s"
     log "  CERT_VALIDITY_DAYS: $CERT_VALIDITY_DAYS"
     log "  CLEANUP_ORPHANED: $CLEANUP_ORPHANED"
+    log "  CA_CERT: $CA_CERT"
+    log "  CA_KEY: $CA_KEY"
+    log "  CA_VALIDITY_DAYS: $CA_VALIDITY_DAYS"
+    log "  CA_CN: $CA_CN"
+    log "  LEAF_VALIDITY_DAYS: $LEAF_VALIDITY_DAYS"
 }
 
 # Initialize the script.
 # ----------------------
 # We want to create the domain file from the example if it doesn't exist.
-# Then we want to showcase what the config setup looks like on stdout.
+# Then we want to ensure the local Root CA is present (generated on first run).
+# After that, showcase what the config setup looks like on stdout.
 # Finally, start processing the domain list before setting up the watcher.
 init_domains_file
+ensure_root_ca
 display_config
 process_domains
 

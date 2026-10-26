@@ -6,9 +6,12 @@ config/cert-helper/domains.conf
 # Users should copy buckets.example.conf to buckets.conf and modify it.
 config/minio/buckets.conf
 
-# Ignore generated certificates.
+# Ignore generated certificates and the local Root CA.
 config/nginx-proxy/certs/*.key
 config/nginx-proxy/certs/*.crt
+config/nginx-proxy/certs/*.srl
+config/nginx-proxy/certs/*.csr
+config/nginx-proxy/certs/*.ext
 
 # Ignore any application specific proxy configs.
 config/nginx-proxy/vhost.d/
